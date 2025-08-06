@@ -1,10 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h> //Requires by memset
+#include <string.h> 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
-#include "esp_spi_flash.h"
+#include "spi_flash_mmap.h"
 #include <esp_https_server.h>
 
 #include "esp_wifi.h"
@@ -20,11 +20,13 @@
 #include <lwip/netdb.h>
 
 #include <secrets.h>  // SSL cert headers, Wifi SSID & pass
-#define LED_PIN 2
+#define LED_PIN 23
 
-char on_resp[] = "<!DOCTYPE html><html><head><style type=\"text/css\">html {  font-family: Arial;  display: inline-block;  margin: 0px auto;  text-align: center;}h1{  color: #070812;  padding: 2vh;}.button {  display: inline-block;  background-color: #b30000; //red color  border: none;  border-radius: 4px;  color: white;  padding: 16px 40px;  text-decoration: none;  font-size: 30px;  margin: 2px;  cursor: pointer;}.button2 {  background-color: #364cf4; //blue color}.content {   padding: 50px;}.card-grid {  max-width: 800px;  margin: 0 auto;  display: grid;  grid-gap: 2rem;  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));}.card {  background-color: white;  box-shadow: 2px 2px 12px 1px rgba(140,140,140,.5);}.card-title {  font-size: 1.2rem;  font-weight: bold;  color: #034078}</style>  <title>ESP32 WEB SERVER</title>  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">  <link rel=\"icon\" href=\"data:,\">  <link rel=\"stylesheet\" href=\"https://use.fontawesome.com/releases/v5.7.2/css/all.css\"    integrity=\"sha384-fnmOCqbTlWIlj8LyTjo7mOUStjsKC4pOpQbqyi7RrhN7udi9RwhKkMHpvLbHG9Sr\" crossorigin=\"anonymous\">  <link rel=\"stylesheet\" type=\"text/css\" ></head><body>  <h2>ESP32 WEB SERVER</h2>  <div class=\"content\">    <div class=\"card-grid\">      <div class=\"card\">        <p><i class=\"fas fa-lightbulb fa-2x\" style=\"color:#c81919;\"></i>     <strong>GPIO2</strong></p>        <p>GPIO state: <strong> ON</strong></p>        <p>          <a href=\"/led2on\"><button class=\"button\">ON</button></a>          <a href=\"/led2off\"><button class=\"button button2\">OFF</button></a>        </p>      </div>    </div>  </div></body></html>";
+extern const char on_html_start[] asm("_binary_on_html_start");
+extern const char on_html_end[]   asm("_binary_on_html_end");
 
-char off_resp[] = "<!DOCTYPE html><html><head><style type=\"text/css\">html {  font-family: Arial;  display: inline-block;  margin: 0px auto;  text-align: center;}h1{  color: #070812;  padding: 2vh;}.button {  display: inline-block;  background-color: #b30000; //red color  border: none;  border-radius: 4px;  color: white;  padding: 16px 40px;  text-decoration: none;  font-size: 30px;  margin: 2px;  cursor: pointer;}.button2 {  background-color: #364cf4; //blue color}.content {   padding: 50px;}.card-grid {  max-width: 800px;  margin: 0 auto;  display: grid;  grid-gap: 2rem;  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));}.card {  background-color: white;  box-shadow: 2px 2px 12px 1px rgba(140,140,140,.5);}.card-title {  font-size: 1.2rem;  font-weight: bold;  color: #034078}</style>  <title>ESP32 WEB SERVER</title>  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">  <link rel=\"icon\" href=\"data:,\">  <link rel=\"stylesheet\" href=\"https://use.fontawesome.com/releases/v5.7.2/css/all.css\"    integrity=\"sha384-fnmOCqbTlWIlj8LyTjo7mOUStjsKC4pOpQbqyi7RrhN7udi9RwhKkMHpvLbHG9Sr\" crossorigin=\"anonymous\">  <link rel=\"stylesheet\" type=\"text/css\"></head><body>  <h2>ESP32 WEB SERVER</h2>  <div class=\"content\">    <div class=\"card-grid\">      <div class=\"card\">        <p><i class=\"fas fa-lightbulb fa-2x\" style=\"color:#c81919;\"></i>     <strong>GPIO2</strong></p>        <p>GPIO state: <strong> OFF</strong></p>        <p>          <a href=\"/led2on\"><button class=\"button\">ON</button></a>          <a href=\"/led2off\"><button class=\"button button2\">OFF</button></a>        </p>      </div>    </div>  </div></body></html>";
+extern const char off_html_start[] asm("_binary_off_html_start");
+extern const char off_html_end[]   asm("_binary_off_html_end");
 
 static const char *TAG = "espressif"; // TAG for debug
 int led_state = 0;
@@ -138,23 +140,54 @@ void connect_wifi(void)
     vEventGroupDelete(s_wifi_event_group);
 }
 
+#include <string.h>
+
+bool check_auth(httpd_req_t *req)
+{
+    char auth[128];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof(auth)) == ESP_OK) {
+        ESP_LOGI("AUTH", "Got authorization header: %s", auth);
+        if (strcmp(auth, AUTH_HEADER) == 0) {
+            return true;
+        }
+    }
+
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP32 Secure Area\"");
+    httpd_resp_send(req, "Authentication required", HTTPD_RESP_USE_STRLEN);
+    return false;
+}
+
+
 
 esp_err_t send_web_page(httpd_req_t *req)
 {
     int response;
-    if (led_state == 0)
-        response = httpd_resp_send(req, off_resp, HTTPD_RESP_USE_STRLEN);
-    else
-        response = httpd_resp_send(req, on_resp, HTTPD_RESP_USE_STRLEN);
+    if (led_state == 0) {
+        const char *resp = off_html_start;
+        size_t len = off_html_end - off_html_start;
+        httpd_resp_set_type(req, "text/html");
+        response = httpd_resp_send(req, resp, len);
+    } else {    
+        const char *resp = on_html_start;
+        size_t len = on_html_end - on_html_start;
+        httpd_resp_set_type(req, "text/html");
+        response = httpd_resp_send(req, resp, len);
+    }
     return response;
 }
+
 esp_err_t get_req_handler(httpd_req_t *req)
 {
+    if (!check_auth(req)) return ESP_FAIL;
     return send_web_page(req);
 }
 
+
 esp_err_t led_on_handler(httpd_req_t *req)
-{
+{   
+    if (!check_auth(req)) return ESP_FAIL;
     gpio_set_level(LED_PIN, 1);
     led_state = 1;
     return send_web_page(req);
@@ -162,6 +195,7 @@ esp_err_t led_on_handler(httpd_req_t *req)
 
 esp_err_t led_off_handler(httpd_req_t *req)
 {
+    if (!check_auth(req)) return ESP_FAIL;
     gpio_set_level(LED_PIN, 0);
     led_state = 0;
     return send_web_page(req);
